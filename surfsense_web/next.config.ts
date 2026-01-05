@@ -48,6 +48,10 @@ const nextConfig: NextConfig = {
 				source: "/ingest/decide",
 				destination: "https://us.i.posthog.com/decide",
 			},
+			{
+				source: "/api/proxy/:path*",
+				destination: `${process.env.FASTAPI_BACKEND_URL || "http://localhost:8000"}/:path*`,
+			},
 		];
 	},
 	// Required for PostHog reverse proxy to work correctly
