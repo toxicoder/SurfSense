@@ -298,4 +298,9 @@ class BaseApiService {
 	}
 }
 
-export const baseApiService = new BaseApiService(process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL || "");
+const isServer = typeof window === "undefined";
+const baseUrl = isServer
+	? process.env.FASTAPI_BACKEND_URL || process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL || ""
+	: "/api/proxy";
+
+export const baseApiService = new BaseApiService(baseUrl);
