@@ -15,26 +15,19 @@ import contextlib
 import os
 import tempfile
 import uuid
-from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy.orm import selectinload
 
 from app.db import (
-    NewChatMessage,
-    NewChatMessageRole,
-    NewChatThread,
     Permission,
     SearchSpace,
     User,
     get_async_session,
 )
 from app.schemas.new_chat import (
-    NewChatMessageAppend,
     NewChatMessageRead,
     NewChatRequest,
     NewChatThreadCreate,
@@ -45,6 +38,7 @@ from app.schemas.new_chat import (
     ThreadListItem,
     ThreadListResponse,
 )
+from app.services.chat_service import ChatService
 from app.tasks.chat.stream_new_chat import stream_new_chat
 from app.users import current_active_user
 from app.utils.rbac import check_permission
@@ -74,59 +68,33 @@ async def list_threads(
 
     Requires CHATS_READ permission.
     """
-    try:
-        await check_permission(
-            session,
-            user,
-            search_space_id,
-            Permission.CHATS_READ.value,
-            "You don't have permission to read chats in this search space",
+    service = ChatService(session, user)
+    active_threads, archived_threads_db = await service.list_threads(search_space_id, limit)
+
+    # Convert to schema
+    threads = [
+        ThreadListItem(
+            id=thread.id,
+            title=thread.title,
+            archived=thread.archived,
+            created_at=thread.created_at,
+            updated_at=thread.updated_at,
         )
+        for thread in active_threads
+    ]
 
-        # Get all threads in this search space
-        query = (
-            select(NewChatThread)
-            .filter(NewChatThread.search_space_id == search_space_id)
-            .order_by(NewChatThread.updated_at.desc())
+    archived_threads = [
+        ThreadListItem(
+            id=thread.id,
+            title=thread.title,
+            archived=thread.archived,
+            created_at=thread.created_at,
+            updated_at=thread.updated_at,
         )
+        for thread in archived_threads_db
+    ]
 
-        result = await session.execute(query)
-        all_threads = result.scalars().all()
-
-        # Separate active and archived threads
-        threads = []
-        archived_threads = []
-
-        for thread in all_threads:
-            item = ThreadListItem(
-                id=thread.id,
-                title=thread.title,
-                archived=thread.archived,
-                created_at=thread.created_at,
-                updated_at=thread.updated_at,
-            )
-            if thread.archived:
-                archived_threads.append(item)
-            else:
-                threads.append(item)
-
-        # Apply limit to active threads if specified
-        if limit is not None and limit > 0:
-            threads = threads[:limit]
-
-        return ThreadListResponse(threads=threads, archived_threads=archived_threads)
-
-    except HTTPException:
-        raise
-    except OperationalError:
-        raise HTTPException(
-            status_code=503, detail="Database operation failed. Please try again later."
-        ) from None
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"An unexpected error occurred while fetching threads: {e!s}",
-        ) from None
+    return ThreadListResponse(threads=threads, archived_threads=archived_threads)
 
 
 @router.get("/threads/search", response_model=list[ThreadListItem])
@@ -145,50 +113,19 @@ async def search_threads(
 
     Requires CHATS_READ permission.
     """
-    try:
-        await check_permission(
-            session,
-            user,
-            search_space_id,
-            Permission.CHATS_READ.value,
-            "You don't have permission to read chats in this search space",
+    service = ChatService(session, user)
+    threads = await service.search_threads(search_space_id, title)
+
+    return [
+        ThreadListItem(
+            id=thread.id,
+            title=thread.title,
+            archived=thread.archived,
+            created_at=thread.created_at,
+            updated_at=thread.updated_at,
         )
-
-        # Search threads by title (case-insensitive)
-        query = (
-            select(NewChatThread)
-            .filter(
-                NewChatThread.search_space_id == search_space_id,
-                NewChatThread.title.ilike(f"%{title}%"),
-            )
-            .order_by(NewChatThread.updated_at.desc())
-        )
-
-        result = await session.execute(query)
-        threads = result.scalars().all()
-
-        return [
-            ThreadListItem(
-                id=thread.id,
-                title=thread.title,
-                archived=thread.archived,
-                created_at=thread.created_at,
-                updated_at=thread.updated_at,
-            )
-            for thread in threads
-        ]
-
-    except HTTPException:
-        raise
-    except OperationalError:
-        raise HTTPException(
-            status_code=503, detail="Database operation failed. Please try again later."
-        ) from None
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"An unexpected error occurred while searching threads: {e!s}",
-        ) from None
+        for thread in threads
+    ]
 
 
 @router.post("/threads", response_model=NewChatThreadRead)
@@ -202,46 +139,8 @@ async def create_thread(
 
     Requires CHATS_CREATE permission.
     """
-    try:
-        await check_permission(
-            session,
-            user,
-            thread.search_space_id,
-            Permission.CHATS_CREATE.value,
-            "You don't have permission to create chats in this search space",
-        )
-
-        now = datetime.now(UTC)
-        db_thread = NewChatThread(
-            title=thread.title,
-            archived=thread.archived,
-            search_space_id=thread.search_space_id,
-            updated_at=now,
-        )
-        session.add(db_thread)
-        await session.commit()
-        await session.refresh(db_thread)
-        return db_thread
-
-    except HTTPException:
-        raise
-    except IntegrityError:
-        await session.rollback()
-        raise HTTPException(
-            status_code=400,
-            detail="Database constraint violation. Please check your input data.",
-        ) from None
-    except OperationalError:
-        await session.rollback()
-        raise HTTPException(
-            status_code=503, detail="Database operation failed. Please try again later."
-        ) from None
-    except Exception as e:
-        await session.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=f"An unexpected error occurred while creating the thread: {e!s}",
-        ) from None
+    service = ChatService(session, user)
+    return await service.create_thread(thread)
 
 
 @router.get("/threads/{thread_id}", response_model=ThreadHistoryLoadResponse)
@@ -256,52 +155,22 @@ async def get_thread_messages(
 
     Requires CHATS_READ permission.
     """
-    try:
-        # Get thread with messages
-        result = await session.execute(
-            select(NewChatThread)
-            .options(selectinload(NewChatThread.messages))
-            .filter(NewChatThread.id == thread_id)
+    service = ChatService(session, user)
+    thread = await service.get_thread_with_messages(thread_id)
+
+    # Return messages in the format expected by assistant-ui
+    messages = [
+        NewChatMessageRead(
+            id=msg.id,
+            thread_id=msg.thread_id,
+            role=msg.role,
+            content=msg.content,
+            created_at=msg.created_at,
         )
-        thread = result.scalars().first()
+        for msg in thread.messages
+    ]
 
-        if not thread:
-            raise HTTPException(status_code=404, detail="Thread not found")
-
-        # Check permission and ownership
-        await check_permission(
-            session,
-            user,
-            thread.search_space_id,
-            Permission.CHATS_READ.value,
-            "You don't have permission to read chats in this search space",
-        )
-
-        # Return messages in the format expected by assistant-ui
-        messages = [
-            NewChatMessageRead(
-                id=msg.id,
-                thread_id=msg.thread_id,
-                role=msg.role,
-                content=msg.content,
-                created_at=msg.created_at,
-            )
-            for msg in thread.messages
-        ]
-
-        return ThreadHistoryLoadResponse(messages=messages)
-
-    except HTTPException:
-        raise
-    except OperationalError:
-        raise HTTPException(
-            status_code=503, detail="Database operation failed. Please try again later."
-        ) from None
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"An unexpected error occurred while fetching the thread: {e!s}",
-        ) from None
+    return ThreadHistoryLoadResponse(messages=messages)
 
 
 @router.get("/threads/{thread_id}/full", response_model=NewChatThreadWithMessages)
@@ -315,38 +184,8 @@ async def get_thread_full(
 
     Requires CHATS_READ permission.
     """
-    try:
-        result = await session.execute(
-            select(NewChatThread)
-            .options(selectinload(NewChatThread.messages))
-            .filter(NewChatThread.id == thread_id)
-        )
-        thread = result.scalars().first()
-
-        if not thread:
-            raise HTTPException(status_code=404, detail="Thread not found")
-
-        await check_permission(
-            session,
-            user,
-            thread.search_space_id,
-            Permission.CHATS_READ.value,
-            "You don't have permission to read chats in this search space",
-        )
-
-        return thread
-
-    except HTTPException:
-        raise
-    except OperationalError:
-        raise HTTPException(
-            status_code=503, detail="Database operation failed. Please try again later."
-        ) from None
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"An unexpected error occurred while fetching the thread: {e!s}",
-        ) from None
+    service = ChatService(session, user)
+    return await service.get_thread_with_messages(thread_id)
 
 
 @router.put("/threads/{thread_id}", response_model=NewChatThreadRead)
@@ -362,53 +201,8 @@ async def update_thread(
 
     Requires CHATS_UPDATE permission.
     """
-    try:
-        result = await session.execute(
-            select(NewChatThread).filter(NewChatThread.id == thread_id)
-        )
-        db_thread = result.scalars().first()
-
-        if not db_thread:
-            raise HTTPException(status_code=404, detail="Thread not found")
-
-        await check_permission(
-            session,
-            user,
-            db_thread.search_space_id,
-            Permission.CHATS_UPDATE.value,
-            "You don't have permission to update chats in this search space",
-        )
-
-        # Update fields
-        update_data = thread_update.model_dump(exclude_unset=True)
-        for key, value in update_data.items():
-            setattr(db_thread, key, value)
-
-        db_thread.updated_at = datetime.now(UTC)
-
-        await session.commit()
-        await session.refresh(db_thread)
-        return db_thread
-
-    except HTTPException:
-        raise
-    except IntegrityError:
-        await session.rollback()
-        raise HTTPException(
-            status_code=400,
-            detail="Database constraint violation. Please check your input data.",
-        ) from None
-    except OperationalError:
-        await session.rollback()
-        raise HTTPException(
-            status_code=503, detail="Database operation failed. Please try again later."
-        ) from None
-    except Exception as e:
-        await session.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=f"An unexpected error occurred while updating the thread: {e!s}",
-        ) from None
+    service = ChatService(session, user)
+    return await service.update_thread(thread_id, thread_update)
 
 
 @router.delete("/threads/{thread_id}", response_model=dict)
@@ -422,45 +216,9 @@ async def delete_thread(
 
     Requires CHATS_DELETE permission.
     """
-    try:
-        result = await session.execute(
-            select(NewChatThread).filter(NewChatThread.id == thread_id)
-        )
-        db_thread = result.scalars().first()
-
-        if not db_thread:
-            raise HTTPException(status_code=404, detail="Thread not found")
-
-        await check_permission(
-            session,
-            user,
-            db_thread.search_space_id,
-            Permission.CHATS_DELETE.value,
-            "You don't have permission to delete chats in this search space",
-        )
-
-        await session.delete(db_thread)
-        await session.commit()
-        return {"message": "Thread deleted successfully"}
-
-    except HTTPException:
-        raise
-    except IntegrityError:
-        await session.rollback()
-        raise HTTPException(
-            status_code=400, detail="Cannot delete thread due to existing dependencies."
-        ) from None
-    except OperationalError:
-        await session.rollback()
-        raise HTTPException(
-            status_code=503, detail="Database operation failed. Please try again later."
-        ) from None
-    except Exception as e:
-        await session.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=f"An unexpected error occurred while deleting the thread: {e!s}",
-        ) from None
+    service = ChatService(session, user)
+    await service.delete_thread(thread_id)
+    return {"message": "Thread deleted successfully"}
 
 
 # =============================================================================
@@ -481,109 +239,20 @@ async def append_message(
 
     Requires CHATS_UPDATE permission.
     """
-    try:
-        # Parse raw body - extract only role and content, ignoring extra fields
-        raw_body = await request.json()
-        role = raw_body.get("role")
-        content = raw_body.get("content")
+    # Parse raw body - extract only role and content, ignoring extra fields
+    raw_body = await request.json()
+    role = raw_body.get("role")
+    content = raw_body.get("content")
 
-        if not role:
-            raise HTTPException(status_code=400, detail="Missing required field: role")
-        if content is None:
-            raise HTTPException(
-                status_code=400, detail="Missing required field: content"
-            )
-
-        # Create message object manually
-        message = NewChatMessageAppend(role=role, content=content)
-        # Get thread
-        result = await session.execute(
-            select(NewChatThread).filter(NewChatThread.id == thread_id)
-        )
-        thread = result.scalars().first()
-
-        if not thread:
-            raise HTTPException(status_code=404, detail="Thread not found")
-
-        await check_permission(
-            session,
-            user,
-            thread.search_space_id,
-            Permission.CHATS_UPDATE.value,
-            "You don't have permission to update chats in this search space",
-        )
-
-        # Convert string role to enum
-        role_str = (
-            message.role.lower() if isinstance(message.role, str) else message.role
-        )
-        try:
-            message_role = NewChatMessageRole(role_str)
-        except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid role: {message.role}. Must be 'user', 'assistant', or 'system'.",
-            ) from None
-
-        # Create message
-        db_message = NewChatMessage(
-            thread_id=thread_id,
-            role=message_role,
-            content=message.content,
-        )
-        session.add(db_message)
-
-        # Update thread's updated_at timestamp
-        thread.updated_at = datetime.now(UTC)
-
-        # Auto-generate title from first user message if title is still default
-        if thread.title == "New Chat" and role_str == "user":
-            # Extract text content for title
-            content = message.content
-            if isinstance(content, str):
-                title_text = content
-            elif isinstance(content, list):
-                # Find first text content
-                title_text = ""
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        title_text = part.get("text", "")
-                        break
-                    elif isinstance(part, str):
-                        title_text = part
-                        break
-            else:
-                title_text = str(content)
-
-            # Truncate title
-            if title_text:
-                thread.title = title_text[:100] + (
-                    "..." if len(title_text) > 100 else ""
-                )
-
-        await session.commit()
-        await session.refresh(db_message)
-        return db_message
-
-    except HTTPException:
-        raise
-    except IntegrityError:
-        await session.rollback()
+    if not role:
+        raise HTTPException(status_code=400, detail="Missing required field: role")
+    if content is None:
         raise HTTPException(
-            status_code=400,
-            detail="Database constraint violation. Please check your input data.",
-        ) from None
-    except OperationalError:
-        await session.rollback()
-        raise HTTPException(
-            status_code=503, detail="Database operation failed. Please try again later."
-        ) from None
-    except Exception as e:
-        await session.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=f"An unexpected error occurred while appending the message: {e!s}",
-        ) from None
+            status_code=400, detail="Missing required field: content"
+        )
+
+    service = ChatService(session, user)
+    return await service.append_message(thread_id, role, content)
 
 
 @router.get("/threads/{thread_id}/messages", response_model=list[NewChatMessageRead])
@@ -599,47 +268,8 @@ async def list_messages(
 
     Requires CHATS_READ permission.
     """
-    try:
-        # Verify thread exists and user has access
-        result = await session.execute(
-            select(NewChatThread).filter(NewChatThread.id == thread_id)
-        )
-        thread = result.scalars().first()
-
-        if not thread:
-            raise HTTPException(status_code=404, detail="Thread not found")
-
-        await check_permission(
-            session,
-            user,
-            thread.search_space_id,
-            Permission.CHATS_READ.value,
-            "You don't have permission to read chats in this search space",
-        )
-
-        # Get messages
-        query = (
-            select(NewChatMessage)
-            .filter(NewChatMessage.thread_id == thread_id)
-            .order_by(NewChatMessage.created_at)
-            .offset(skip)
-            .limit(limit)
-        )
-
-        result = await session.execute(query)
-        return result.scalars().all()
-
-    except HTTPException:
-        raise
-    except OperationalError:
-        raise HTTPException(
-            status_code=503, detail="Database operation failed. Please try again later."
-        ) from None
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"An unexpected error occurred while fetching messages: {e!s}",
-        ) from None
+    service = ChatService(session, user)
+    return await service.list_messages(thread_id, skip, limit)
 
 
 # =============================================================================
@@ -662,36 +292,51 @@ async def handle_new_chat(
     Requires CHATS_CREATE permission.
     """
     try:
+        # Use ChatService just to verify access (optional, but good practice)
+        # However, stream_new_chat task might do its own checks or rely on the caller?
+        # The original code checked permission explicitly.
+
+        # We can use a lightweight service method or just keep the check here.
+        # Keeping it here is fine as it's "controller" logic for this endpoint.
+
         # Verify thread exists and user has permission
+        # Note: ChatService doesn't have a simple "check_permission" public method yet.
+        # We can implement one or just use check_permission util directly.
+        # Let's use check_permission directly to avoid overhead of fetching full thread if not needed,
+        # but we need the thread object anyway.
+
+        service = ChatService(session, user)
+        # This will fetch thread and check READ/UPDATE permissions?
+        # Actually handle_new_chat requires CHATS_CREATE (weird, maybe CHATS_UPDATE?)
+        # Original code: CHATS_CREATE.
+
+        # We can just fetch the thread using service (which checks READ) and then check CREATE?
+        # Or just stick to original logic here since it involves SearchSpace config too.
+
+        # Verify thread access first (IDOR fix)
+        service = ChatService(session, user)
+        # Only verify if chat_id exists and is not 0/new
+        if request.chat_id and request.chat_id > 0:
+            await service.verify_thread_access(request.chat_id, request.search_space_id)
+
+        # Original Logic:
         result = await session.execute(
-            select(NewChatThread).filter(NewChatThread.id == request.chat_id)
-        )
-        thread = result.scalars().first()
-
-        if not thread:
-            raise HTTPException(status_code=404, detail="Thread not found")
-
-        await check_permission(
-            session,
-            user,
-            thread.search_space_id,
-            Permission.CHATS_CREATE.value,
-            "You don't have permission to chat in this search space",
-        )
-
-        # Get search space to check LLM config preferences
-        search_space_result = await session.execute(
             select(SearchSpace).filter(SearchSpace.id == request.search_space_id)
         )
-        search_space = search_space_result.scalars().first()
+        search_space = result.scalars().first()
 
         if not search_space:
             raise HTTPException(status_code=404, detail="Search space not found")
 
+        await check_permission(
+            session,
+            user,
+            request.search_space_id,
+            Permission.CHATS_CREATE.value,
+            "You don't have permission to chat in this search space",
+        )
+
         # Use agent_llm_id from search space for chat operations
-        # Positive IDs load from NewLLMConfig database table
-        # Negative IDs load from YAML global configs
-        # Falls back to -1 (first global config) if not configured
         llm_config_id = (
             search_space.agent_llm_id if search_space.agent_llm_id is not None else -1
         )
