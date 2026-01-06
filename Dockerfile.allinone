@@ -50,59 +50,103 @@ ENV NEXT_PUBLIC_ETL_SERVICE=$NEXT_PUBLIC_ETL_SERVICE
 RUN pnpm run build
 
 # ====================
-# Stage 2: Runtime Image
+# Stage 2: Pgvector Builder
+# ====================
+FROM ubuntu:22.04 AS pgvector-builder
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    postgresql-server-dev-14 \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build pgvector
+WORKDIR /tmp
+RUN git clone --branch v0.7.4 https://github.com/pgvector/pgvector.git \
+    && cd pgvector \
+    && make \
+    && make install
+
+# ====================
+# Stage 3: Backend Builder
+# ====================
+FROM ubuntu:22.04 AS backend-builder
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Python build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    curl \
+    ca-certificates \
+    git \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-venv \
+    python3.12-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+
+WORKDIR /app
+
+# Create virtual environment
+RUN python3.12 -m venv /app/.venv
+ENV PATH="/app/.venv/bin:$PATH"
+
+# Copy dependency definitions
+COPY surfsense_backend/pyproject.toml surfsense_backend/uv.lock ./
+
+# Generate requirements.txt from lockfile (excluding the project itself)
+RUN uv export --frozen --no-dev --format requirements-txt > requirements.txt
+
+# Install dependencies
+# 1. Install PyTorch CPU explicitly to avoid CUDA bloat
+RUN uv pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# 2. Install critical runtime tools (supervisor, certifi) and project dependencies
+RUN uv pip install --no-cache-dir supervisor certifi pip-system-certs -r requirements.txt
+
+# ====================
+# Stage 4: Runtime Image
 # ====================
 FROM ubuntu:22.04 AS runtime
 
 # Prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies
+# Install runtime system dependencies
+# Grouping all apt-get install calls to a single layer
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # PostgreSQL
+    # PostgreSQL & Redis
     postgresql-14 \
     postgresql-contrib-14 \
-    # Build tools for pgvector
-    build-essential \
-    postgresql-server-dev-14 \
-    git \
-    # Redis
     redis-server \
-    # Node.js prerequisites
+    # Node.js prerequisites (for installing node later)
     curl \
     ca-certificates \
     gnupg \
-    # Backend dependencies
-    gcc \
-    wget \
+    # Backend Runtime Libs
     unzip \
     dos2unix \
     # For PPAs
     software-properties-common \
-    # ============================
-    # Local TTS (Kokoro) dependencies
-    # ============================
+    # TTS/STT/Audio Libs
     espeak-ng \
     libespeak-ng1 \
-    # ============================
-    # Local STT (Faster-Whisper) dependencies
-    # ============================
     ffmpeg \
-    # ============================
-    # Audio processing (soundfile)
-    # ============================
     libsndfile1 \
-    # ============================
-    # Image/OpenCV dependencies (for Docling)
-    # ============================
+    # Image/Docling Libs
     libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
     libxrender1 \
-    # ============================
-    # Playwright browser dependencies
-    # ============================
+    # Playwright Deps
     libnspr4 \
     libnss3 \
     libatk1.0-0 \
@@ -116,92 +160,54 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgbm1 \
     libcairo2 \
     libpango-1.0-0 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Node.js 20.x (for running frontend)
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python 3.12 from deadsnakes PPA
-RUN add-apt-repository ppa:deadsnakes/ppa -y \
+    # Install Python 3.12
+    && add-apt-repository ppa:deadsnakes/ppa -y \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
     python3.12 \
     python3.12-venv \
-    python3.12-dev \
+    # Install Node.js 20.x
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    # Set Python 3.12 as default
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    # Cleanup
+    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-# Set Python 3.12 as default
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+# Copy pgvector artifacts
+COPY --from=pgvector-builder /usr/lib/postgresql/14/lib/vector.so /usr/lib/postgresql/14/lib/
+COPY --from=pgvector-builder /usr/share/postgresql/14/extension/vector* /usr/share/postgresql/14/extension/
 
-# Install pip for Python 3.12
-RUN python3.12 -m ensurepip --upgrade \
-    && python3.12 -m pip install --upgrade pip
+# Setup Backend Environment
+WORKDIR /app
+COPY --from=backend-builder /app/.venv /app/.venv
+ENV PATH="/app/.venv/bin:$PATH"
 
-# Install supervisor via pip (system package incompatible with Python 3.12)
-RUN pip install --no-cache-dir supervisor
+# Setup SSL
+RUN CERTIFI_PATH=$(python -c "import certifi; print(certifi.where())") \
+    && echo "export SSL_CERT_FILE=$CERTIFI_PATH" > /etc/profile.d/ssl.sh \
+    && echo "export REQUESTS_CA_BUNDLE=$CERTIFI_PATH" >> /etc/profile.d/ssl.sh
 
-# Build and install pgvector
-RUN cd /tmp \
-    && git clone --branch v0.7.4 https://github.com/pgvector/pgvector.git \
-    && cd pgvector \
-    && make \
-    && make install \
-    && rm -rf /tmp/pgvector
+# Install Playwright browsers (Chromium only) & Cleanup
+# We run this in runtime to match architecture, but clean up immediately
+RUN playwright install chromium \
+    && rm -rf /root/.cache/ms-playwright/ffmpeg* \
+    && rm -rf /root/.cache/ms-playwright/firefox* \
+    && rm -rf /root/.cache/ms-playwright/webkit*
 
-# Update certificates
-RUN update-ca-certificates
+# Copy Backend Source
+WORKDIR /app/backend
+COPY surfsense_backend/ ./
 
-# Create data directories
-RUN mkdir -p /data/postgres /data/redis /data/surfsense \
-    && chown -R postgres:postgres /data/postgres
-
-# ====================
 # Copy Frontend Build
-# ====================
 WORKDIR /app/frontend
-
-# Copy only the standalone build (not node_modules)
 COPY --from=frontend-builder /app/.next/standalone ./
 COPY --from=frontend-builder /app/.next/static ./.next/static
 COPY --from=frontend-builder /app/public ./public
 
-# ====================
-# Setup Backend
-# ====================
-WORKDIR /app/backend
-
-# Copy backend dependency files
-COPY surfsense_backend/pyproject.toml surfsense_backend/uv.lock ./
-
-# Install PyTorch CPU-only (Docling needs it but OCR is disabled, no GPU needed)
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
-
-# Install python dependencies
-RUN pip install --no-cache-dir certifi pip-system-certs uv \
-    && uv pip install --system --no-cache-dir -e .
-
-# Set SSL environment variables
-RUN CERTIFI_PATH=$(python -c "import certifi; print(certifi.where())") \
-    && echo "export SSL_CERT_FILE=$CERTIFI_PATH" >> /etc/profile.d/ssl.sh \
-    && echo "export REQUESTS_CA_BUNDLE=$CERTIFI_PATH" >> /etc/profile.d/ssl.sh
-
-# Note: EasyOCR models NOT downloaded - OCR is disabled in docling_service.py
-# GPU support will be added in a future :cuda tagged image
-
-# Install Playwright browsers
-RUN pip install --no-cache-dir playwright \
-    && playwright install chromium \
-    && rm -rf /root/.cache/ms-playwright/ffmpeg* 
-
-# Copy backend source
-COPY surfsense_backend/ ./
-
-# ====================
 # Configuration
-# ====================
 WORKDIR /app
 
 # Copy supervisor configuration
@@ -215,10 +221,9 @@ RUN dos2unix /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 COPY scripts/docker/init-postgres.sh /app/init-postgres.sh
 RUN dos2unix /app/init-postgres.sh && chmod +x /app/init-postgres.sh
 
-# Clean up build dependencies to reduce image size
-RUN apt-get purge -y build-essential postgresql-server-dev-14 git \
-    && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+# Create data directories
+RUN mkdir -p /data/postgres /data/redis /data/surfsense \
+    && chown -R postgres:postgres /data/postgres
 
 # Environment variables with defaults
 ENV POSTGRES_USER=surfsense
