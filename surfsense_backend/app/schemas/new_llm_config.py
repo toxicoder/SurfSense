@@ -33,7 +33,7 @@ class NewLLMConfigBase(BaseModel):
     model_name: str = Field(
         ..., max_length=100, description="Model name without provider prefix"
     )
-    api_key: str = Field(..., description="API key for the provider")
+    # api_key moved to NewLLMConfigCreate to avoid returning it in Read
     api_base: str | None = Field(
         None, max_length=500, description="Optional API base URL"
     )
@@ -59,6 +59,7 @@ class NewLLMConfigBase(BaseModel):
 class NewLLMConfigCreate(NewLLMConfigBase):
     """Schema for creating a new NewLLMConfig."""
 
+    api_key: str = Field(..., description="API key for the provider")
     search_space_id: int = Field(
         ..., description="Search space ID to associate the config with"
     )

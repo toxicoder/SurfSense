@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, declared_attr, relationship
 
 from app.config import config
+from app.utils.encryption import EncryptedString
 
 if config.AUTH_TYPE == "GOOGLE":
     from fastapi_users.db import SQLAlchemyBaseOAuthAccountTableUUID
@@ -583,7 +584,7 @@ class NewLLMConfig(BaseModel, TimestampMixin):
     # Just the model name without provider prefix
     model_name = Column(String(100), nullable=False)
     # API Key should be encrypted before storing
-    api_key = Column(String, nullable=False)
+    api_key = Column(EncryptedString, nullable=False)
     api_base = Column(String(500), nullable=True)
     # For any other parameters that litellm supports
     litellm_params = Column(JSON, nullable=True, default={})
